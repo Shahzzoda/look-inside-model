@@ -1,0 +1,714 @@
+<title>Forward-pass graph — trace activations layer by layer</title>
+<style>
+  :root {
+    --ground: #0c0e16;
+    --panel: #141826;
+    --panel-2: #1b2030;
+    --panel-3: #222a3c;
+    --border: #2a3142;
+    --border-soft: #20283a;
+    --text: #eceef6;
+    --muted: #828aa0;
+    --accent: #f5a623;
+    --accent-dim: #6e521e;
+    --blue: #4b8fe6;
+    --good: #46c9a6;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--ground); color: var(--text); font-family: var(--sans); -webkit-font-smoothing: antialiased; }
+  .app { display: flex; flex-direction: column; min-height: 100vh; }
+
+  /* ---- top bar ---- */
+  header {
+    padding: 18px 26px; border-bottom: 1px solid var(--border);
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 22px;
+  }
+  header h1 { font-size: 18px; font-weight: 650; letter-spacing: -0.01em; margin: 0; }
+  header .eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: .16em; text-transform: uppercase; color: var(--accent); margin: 0; width: 100%; }
+  header .meta { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  header .meta b { color: var(--text); font-weight: 600; }
+  header .prompt { font-family: var(--mono); font-size: 12.5px; color: var(--muted); }
+  header .prompt .tk { color: #d6c08a; }
+
+  /* ---- two-pane ---- */
+  .panes { display: grid; grid-template-columns: minmax(320px, 1fr) minmax(360px, 460px); flex: 1; min-height: 0; }
+  .graphpane { position: relative; overflow: auto; padding: 30px 26px 80px; border-right: 1px solid var(--border); }
+  .inspector { background: var(--panel); overflow: auto; padding: 24px; }
+
+  /* ---- graph ---- */
+  .hint { font-family: var(--mono); font-size: 12px; color: var(--muted); margin: 0 0 20px; }
+  .hint b { color: var(--accent); font-weight: 600; }
+  .graph { position: relative; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); column-gap: 18px; row-gap: 26px; max-width: 620px; margin: 0 auto; }
+  svg.edges { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; z-index: 0; }
+  svg.edges path { fill: none; stroke: var(--border); stroke-width: 1.5; transition: stroke .15s, stroke-width .15s; }
+  svg.edges path.active { stroke: var(--accent); stroke-width: 2.5; }
+
+  .node {
+    position: relative; z-index: 1; cursor: pointer;
+    background: var(--panel); border: 1.5px solid var(--border);
+    border-radius: 10px; padding: 9px 11px; transition: border-color .12s, opacity .15s, transform .1s, box-shadow .12s;
+  }
+  .node:hover { transform: translateY(-1px); border-color: var(--muted); }
+  .node .nlabel { font-size: 13px; font-weight: 600; line-height: 1.25; }
+  .node .nshape { font-family: var(--mono); font-size: 10.5px; color: var(--muted); margin-top: 2px; }
+  .node .nkind { position: absolute; top: -1px; left: 11px; width: 22px; height: 3px; border-radius: 0 0 3px 3px; }
+  .node.dim { opacity: 0.28; }
+  .node.ancestor { border-color: var(--accent-dim); }
+  .node.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent), 0 6px 24px rgba(245,166,35,.18); }
+
+  /* node accent stripes by kind */
+  .k-input  { background: var(--muted); }
+  .k-embed  { background: #7c6cff; }
+  .k-resid  { background: var(--accent); }
+  .k-ln     { background: #4bd6c4; }
+  .k-qkv    { background: var(--blue); }
+  .k-score  { background: #e0598b; }
+  .k-pattern{ background: #f5a623; }
+  .k-z      { background: #c08bff; }
+  .k-out    { background: var(--good); }
+
+  /* ---- inspector ---- */
+  .insp-empty { color: var(--muted); font-family: var(--mono); font-size: 13px; }
+  .insp-eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); margin: 0 0 4px; }
+  .insp-title { font-size: 20px; font-weight: 650; margin: 0 0 4px; letter-spacing: -.01em; }
+  .insp-hook { font-family: var(--mono); font-size: 12px; color: var(--muted); word-break: break-all; }
+  .insp-op {
+    background: var(--panel-2); border: 1px solid var(--border-soft); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 12px 14px; margin: 16px 0; font-family: var(--mono); font-size: 13px; line-height: 1.55; color: #d8dcea;
+  }
+  .insp-explain { font-size: 14px; color: #c7cbd9; line-height: 1.55; margin: 0 0 16px; }
+  .insp-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+  .chip { font-family: var(--mono); font-size: 11.5px; padding: 4px 9px; border-radius: 7px; background: var(--panel-2); border: 1px solid var(--border-soft); color: var(--muted); }
+  .chip b { color: var(--text); font-weight: 600; }
+
+  .insp-section-label { font-family: var(--mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin: 18px 0 10px; }
+  .parents { display: flex; flex-wrap: wrap; gap: 8px; }
+  .parent-chip { cursor: pointer; font-family: var(--mono); font-size: 12px; padding: 6px 10px; border-radius: 8px; background: var(--panel-2); border: 1px solid var(--border); color: #c7cbd9; transition: border-color .12s, color .12s; }
+  .parent-chip:hover { border-color: var(--accent); color: var(--accent); }
+  .parent-chip::before { content: "← "; color: var(--muted); }
+
+  /* head selector */
+  .heads { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+  .hbtn { font-family: var(--mono); font-size: 12px; padding: 5px 10px; border-radius: 7px; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); cursor: pointer; }
+  .hbtn[aria-pressed="true"] { background: var(--accent); color: #1a1304; border-color: var(--accent); font-weight: 600; }
+
+  /* heatmap */
+  .hm-wrap { display: flex; gap: 8px; }
+  .hm-rowlabels { display: flex; flex-direction: column; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .hm-rowlabels span { display: flex; align-items: center; justify-content: flex-end; white-space: nowrap; padding-right: 2px; }
+  .hm-scroll { overflow-x: auto; padding-bottom: 6px; flex: 1; }
+  .hm-canvas { display: block; image-rendering: pixelated; border-radius: 4px; }
+  .hm-axis { font-family: var(--mono); font-size: 10.5px; color: var(--muted); margin-top: 8px; }
+  .colorbar { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .cb-grad { height: 11px; width: 130px; border-radius: 3px; }
+
+  /* prediction bars */
+  .pred-rows { display: flex; flex-direction: column; gap: 7px; }
+  .pred-row { display: grid; grid-template-columns: 92px 1fr 52px; align-items: center; gap: 10px; }
+  .pred-tok { font-family: var(--mono); font-size: 13px; white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+  .pred-track { background: var(--panel-2); border-radius: 6px; height: 18px; overflow: hidden; }
+  .pred-meter { height: 100%; background: var(--accent); border-radius: 6px; }
+  .pred-row.is-good .pred-meter { background: var(--good); }
+  .pred-row.is-good .pred-tok { color: var(--good); }
+  .pred-pct { font-family: var(--mono); font-size: 12.5px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+
+  .tok-list { display: flex; flex-wrap: wrap; gap: 7px; }
+  .tok-item { font-family: var(--mono); font-size: 12.5px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 7px; padding: 6px 9px; }
+  .tok-item .id { color: var(--muted); }
+
+  .tip { position: fixed; z-index: 80; pointer-events: none; opacity: 0; transition: opacity .08s; background: #05060b; border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; font-family: var(--mono); font-size: 12px; line-height: 1.45; max-width: 280px; box-shadow: 0 8px 30px rgba(0,0,0,.6); }
+  .tip b { color: var(--accent); }
+
+  a { color: var(--accent); }
+
+  /* ---- tabs ---- */
+  .tabs { display: flex; gap: 6px; padding: 0 26px; background: var(--panel); border-bottom: 1px solid var(--border); }
+  .tab {
+    font-family: var(--mono); font-size: 13px; color: var(--muted); cursor: pointer;
+    background: transparent; border: 0; border-bottom: 2px solid transparent;
+    padding: 13px 14px 11px; transition: color .12s, border-color .12s;
+  }
+  .tab:hover { color: var(--text); }
+  .tab[aria-pressed="true"] { color: var(--accent); border-bottom-color: var(--accent); }
+  .view { flex: 1; min-height: 0; }
+  #view-graph { display: flex; }
+  #view-graph .panes { flex: 1; }
+  [hidden] { display: none !important; }
+
+  /* ---- activation values tab ---- */
+  #view-acts { display: flex; flex-direction: column; }
+  .acts { display: flex; flex-direction: column; height: 100%; padding: 18px 26px 18px; gap: 12px; min-height: 0; }
+  .acts-toolbar { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: center; justify-content: space-between; }
+  .stepper { display: flex; align-items: center; gap: 10px; }
+  .stepbtn { font-family: var(--mono); font-size: 15px; color: var(--text); background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; width: 34px; height: 34px; cursor: pointer; }
+  .stepbtn:hover { border-color: var(--accent); color: var(--accent); }
+  .stage-select { font-family: var(--mono); font-size: 13px; background: var(--panel-2); border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 8px; max-width: 280px; }
+  .step-count { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .acts-controls { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+  .zoomlab { display: flex; align-items: center; gap: 9px; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .zoomlab input { accent-color: var(--accent); }
+  .acts-op { font-family: var(--mono); font-size: 13px; line-height: 1.5; color: #d8dcea; background: var(--panel-2); border: 1px solid var(--border-soft); border-left: 3px solid var(--accent); border-radius: 8px; padding: 11px 13px; }
+  .acts-op .ex { color: var(--muted); display: block; margin-top: 5px; }
+  .acts-stats { display: flex; flex-wrap: wrap; gap: 8px; }
+  .acts-stats .chip { font-family: var(--mono); font-size: 11.5px; padding: 4px 9px; border-radius: 7px; background: var(--panel-2); border: 1px solid var(--border-soft); color: var(--muted); }
+  .acts-stats .chip b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .acts-gridwrap { flex: 1; min-height: 160px; overflow: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); }
+  table.numgrid { border-collapse: separate; border-spacing: 0; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .numgrid th { position: sticky; background: var(--panel-3); color: var(--muted); font-weight: 500; }
+  .numgrid thead th { top: 0; z-index: 2; padding: 5px 4px; text-align: center; }
+  .numgrid tbody th { left: 0; z-index: 1; text-align: right; padding: 0 9px; white-space: nowrap; color: #c7cbd9; }
+  .numgrid thead th.corner { left: 0; z-index: 3; }
+  .numgrid td { text-align: center; padding: 4px 5px; border-right: 1px solid rgba(0,0,0,.18); border-bottom: 1px solid rgba(0,0,0,.18); }
+  .numgrid td.masked { background: #10121c; color: #3a4258; }
+  .numgrid tbody tr:hover th { color: var(--accent); }
+  .numgrid tbody tr:hover td { filter: brightness(1.18); }
+
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+  @media (max-width: 820px) {
+    #view-graph { flex-direction: column; }
+    .panes { grid-template-columns: 1fr; }
+    .graphpane { border-right: 0; border-bottom: 1px solid var(--border); max-height: 60vh; }
+  }
+</style>
+
+<div class="app">
+  <header>
+    <p class="eyebrow">Mechanistic Interpretability · Forward-Pass Graph</p>
+    <h1>Trace the activations, layer by layer</h1>
+    <span class="meta" id="meta"></span>
+    <span class="prompt" id="prompt"></span>
+  </header>
+
+  <nav class="tabs" id="tabs">
+    <button class="tab" data-view="graph" aria-pressed="true">Computation graph</button>
+    <button class="tab" data-view="acts" aria-pressed="false">Activation values</button>
+  </nav>
+
+  <div id="view-graph" class="view">
+  <div class="panes">
+    <div class="graphpane">
+      <p class="hint">Every box is a <b>real activation tensor</b> from one forward pass. Click any node to inspect its numbers — its <b>inputs light up</b> so you can trace backwards through the computation. Arrows flow top (input) → bottom (prediction).</p>
+      <div class="graph" id="graph">
+        <svg class="edges" id="edges"></svg>
+      </div>
+    </div>
+
+    <div class="inspector" id="inspector">
+      <p class="insp-empty">← Click a node in the graph to inspect its activations.</p>
+    </div>
+  </div>
+  </div><!-- /view-graph -->
+
+  <div id="view-acts" class="view" hidden>
+    <div class="acts">
+      <div class="acts-toolbar">
+        <div class="stepper">
+          <button class="stepbtn" id="act-prev" title="previous stage">←</button>
+          <select class="stage-select" id="act-stage"></select>
+          <button class="stepbtn" id="act-next" title="next stage">→</button>
+          <span class="step-count" id="act-count"></span>
+        </div>
+        <div class="acts-controls">
+          <span class="heads" id="act-heads"></span>
+          <label class="zoomlab">zoom <input type="range" id="act-zoom" min="0" max="4" step="1" value="2"></label>
+        </div>
+      </div>
+      <div class="acts-op" id="act-op"></div>
+      <div class="acts-stats" id="act-stats"></div>
+      <div class="acts-gridwrap"><div id="act-grid"></div></div>
+    </div>
+  </div>
+</div>
+
+<div class="tip" id="tip"></div>
+
+<script id="graph-data" type="application/json">__DATA__</script>
+<script>
+const D = JSON.parse(document.getElementById('graph-data').textContent);
+const A = D.acts;
+const TOKS = D.str_tokens.map(t => t.replace(/ /g, '·').replace(/\n/g, '⏎'));
+const N = D.str_tokens.length;
+const tip = document.getElementById('tip');
+
+document.getElementById('meta').innerHTML =
+  `<b>${D.model}</b> · <b>${D.n_layers}</b> layers · <b>${D.n_heads}</b> heads · <b>${D.d_head}</b> d_head · <b>${D.d_model}</b> d_model`;
+document.getElementById('prompt').innerHTML =
+  'prompt: ' + TOKS.map(t => `<span class="tk">${esc(t)}</span>`).join(' ');
+
+// ---------------------------------------------------------------------------
+// NODE DEFINITIONS — build the DAG for n_layers
+// ---------------------------------------------------------------------------
+// kind drives the accent stripe + which visualizer to use.
+const NODES = [];
+const byId = {};
+function add(n) { NODES.push(n); byId[n.id] = n; return n; }
+
+let row = 0;
+add({ id: 'tokens', label: 'Tokens', kind: 'input', viz: 'tokens',
+      shape: `[${N}]`, row, col: 1, parents: [],
+      op: 'text → integer token IDs',
+      explain: 'The prompt is split into word-pieces ("tokens"). Each becomes an integer index into the vocabulary.' });
+add({ id: 'positions', label: 'Positions', kind: 'input', viz: 'positions',
+      shape: `[${N}]`, row, col: 3, parents: [],
+      op: 'position index 0 … n−1',
+      explain: 'Each token also carries its position in the sequence, 0-indexed.' });
+row++;
+add({ id: 'hook_embed', label: 'Token embedding', kind: 'embed', viz: 'pos_dmodel',
+      shape: `[${N}, ${D.d_model}]`, row, col: 1, parents: ['tokens'],
+      op: 'embed = W_E[token_id]',
+      explain: 'Each token ID looks up a learned d_model-dimensional row of the embedding matrix W_E. This is the token\'s starting vector.' });
+add({ id: 'hook_pos_embed', label: 'Positional embedding', kind: 'embed', viz: 'pos_dmodel',
+      shape: `[${N}, ${D.d_model}]`, row, col: 3, parents: ['positions'],
+      op: 'pos_embed = W_pos[position]',
+      explain: 'A learned vector per position, so the model can tell token order apart. (This model uses learned positional embeddings, not sinusoids.)' });
+
+for (let L = 0; L < D.n_layers; L++) {
+  row++;
+  const rp = `blocks.${L}.hook_resid_pre`;
+  add({ id: rp, label: `Residual stream — enter L${L}`, kind: 'resid', viz: 'pos_dmodel',
+        shape: `[${N}, ${D.d_model}]`, row, col: 2,
+        parents: L === 0 ? ['hook_embed', 'hook_pos_embed'] : [`blocks.${L-1}.hook_resid_post`],
+        op: L === 0 ? 'resid = embed + pos_embed' : 'resid = resid_post of previous block',
+        explain: 'The residual stream: the running vector (one per token) that every layer reads from and writes back into. ' + (L===0 ? 'It starts as token + position embeddings.' : 'It carries everything earlier layers computed.') });
+  row++;
+  const ln = `blocks.${L}.ln1.hook_normalized`;
+  add({ id: ln, label: `LayerNorm (L${L})`, kind: 'ln', viz: 'pos_dmodel',
+        shape: `[${N}, ${D.d_model}]`, row, col: 2, parents: [rp],
+        op: 'x̂ = (x − mean) / √(var + ε)',
+        explain: 'Before attention reads the stream, it is normalized per token: subtract the mean, divide by the standard deviation. (The learned scale γ and shift β are folded into the next weights.)' });
+  row++;
+  const q = `blocks.${L}.attn.hook_q`, k = `blocks.${L}.attn.hook_k`, v = `blocks.${L}.attn.hook_v`;
+  add({ id: q, label: `Q (L${L})`, kind: 'qkv', viz: 'pos_head_dhead',
+        shape: `[${N}, ${D.n_heads}, ${D.d_head}]`, row, col: 1, parents: [ln],
+        op: 'Q = x̂ · W_Q + b_Q   (per head)',
+        explain: 'The query: "what is each token looking for?" One vector per token, per head.' });
+  add({ id: k, label: `K (L${L})`, kind: 'qkv', viz: 'pos_head_dhead',
+        shape: `[${N}, ${D.n_heads}, ${D.d_head}]`, row, col: 2, parents: [ln],
+        op: 'K = x̂ · W_K + b_K   (per head)',
+        explain: 'The key: "what does each token offer?" Queries get compared against keys to decide attention.' });
+  add({ id: v, label: `V (L${L})`, kind: 'qkv', viz: 'pos_head_dhead',
+        shape: `[${N}, ${D.n_heads}, ${D.d_head}]`, row, col: 3, parents: [ln],
+        op: 'V = x̂ · W_V + b_V   (per head)',
+        explain: 'The value: the information a token passes along if it is attended to.' });
+  row++;
+  const sc = `blocks.${L}.attn.hook_attn_scores`;
+  add({ id: sc, label: `Attention scores (L${L})`, kind: 'score', viz: 'head_qk', signed: true,
+        shape: `[${D.n_heads}, ${N}, ${N}]`, row, col: 2, parents: [q, k],
+        op: 'scores = Q · Kᵀ / √d_head',
+        explain: 'Dot every query against every key, scaled by √d_head. High score = strong match. Future positions are masked out (a token can\'t see ahead).' });
+  row++;
+  const pat = `blocks.${L}.attn.hook_pattern`;
+  add({ id: pat, label: `Attention pattern (L${L})`, kind: 'pattern', viz: 'head_qk',
+        shape: `[${D.n_heads}, ${N}, ${N}]`, row, col: 2, parents: [sc],
+        op: 'pattern = softmax(scores)   over keys',
+        explain: 'Softmax turns each row of scores into probabilities that sum to 1: how much each token attends to each earlier token.' });
+  row++;
+  const z = `blocks.${L}.attn.hook_z`;
+  add({ id: z, label: `z — weighted values (L${L})`, kind: 'z', viz: 'pos_head_dhead',
+        shape: `[${N}, ${D.n_heads}, ${D.d_head}]`, row, col: 2, parents: [pat, v],
+        op: 'z = pattern · V',
+        explain: 'Each token\'s output is the attention-weighted average of the value vectors it attended to.' });
+  row++;
+  const ao = `blocks.${L}.hook_attn_out`;
+  add({ id: ao, label: `Attention output (L${L})`, kind: 'out', viz: 'pos_dmodel',
+        shape: `[${N}, ${D.d_model}]`, row, col: 2, parents: [z],
+        op: 'attn_out = z · W_O + b_O',
+        explain: 'Concatenate all heads and project back to d_model. This is what attention will add into the residual stream.' });
+  row++;
+  const rpo = `blocks.${L}.hook_resid_post`;
+  add({ id: rpo, label: `Residual stream — leave L${L}`, kind: 'resid', viz: 'pos_dmodel',
+        shape: `[${N}, ${D.d_model}]`, row, col: 2, parents: [rp, ao],
+        op: 'resid = resid_pre + attn_out',
+        explain: 'The layer writes its result back by ADDING it to the stream (not replacing). This additive structure is why we can trace contributions backwards.' });
+}
+row++;
+add({ id: 'ln_final.hook_normalized', label: 'Final LayerNorm', kind: 'ln', viz: 'pos_dmodel',
+      shape: `[${N}, ${D.d_model}]`, row, col: 2, parents: [`blocks.${D.n_layers-1}.hook_resid_post`],
+      op: 'x̂ = (x − mean) / √(var + ε)',
+      explain: 'One last normalization of the residual stream before turning it into predictions.' });
+row++;
+add({ id: 'prediction', label: 'Next-token prediction', kind: 'out', viz: 'prediction',
+      shape: `[${D.str_tokens.length} → vocab]`, row, col: 2, parents: ['ln_final.hook_normalized'],
+      op: 'logits = x̂ · W_U + b_U → softmax',
+      explain: 'The final vector at the LAST position is projected onto the whole vocabulary (the unembed W_U) and softmaxed into next-token probabilities.' });
+
+// ---------------------------------------------------------------------------
+// RENDER GRAPH NODES
+// ---------------------------------------------------------------------------
+const graph = document.getElementById('graph');
+const edgesSvg = document.getElementById('edges');
+const nodeEls = {};
+NODES.forEach(n => {
+  const el = document.createElement('div');
+  el.className = 'node';
+  el.style.gridRow = (n.row + 1);
+  el.style.gridColumn = `${n.col} / ${n.col + 1}`;
+  el.innerHTML = `<div class="nkind k-${n.kind}"></div>` +
+                 `<div class="nlabel">${esc(n.label)}</div>` +
+                 `<div class="nshape">${n.shape}</div>`;
+  el.onclick = () => select(n.id);
+  el.onmousemove = (e) => showTip(e, `<b>${esc(n.id)}</b><br>${n.shape}`);
+  el.onmouseleave = hideTip;
+  graph.appendChild(el);
+  nodeEls[n.id] = el;
+});
+
+// ---------------------------------------------------------------------------
+// EDGES — measured from the laid-out DOM, redrawn on resize
+// ---------------------------------------------------------------------------
+const edgePaths = [];
+NODES.forEach(n => n.parents.forEach(pid => {
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  edgesSvg.appendChild(path);
+  edgePaths.push({ el: path, from: pid, to: n.id });
+}));
+
+function drawEdges() {
+  const gr = graph.getBoundingClientRect();
+  edgesSvg.setAttribute('viewBox', `0 0 ${gr.width} ${gr.height}`);
+  edgePaths.forEach(e => {
+    const a = nodeEls[e.from].getBoundingClientRect();
+    const b = nodeEls[e.to].getBoundingClientRect();
+    const x1 = a.left - gr.left + a.width / 2, y1 = a.bottom - gr.top;
+    const x2 = b.left - gr.left + b.width / 2, y2 = b.top - gr.top;
+    const my = (y1 + y2) / 2;
+    e.el.setAttribute('d', `M ${x1} ${y1} C ${x1} ${my}, ${x2} ${my}, ${x2} ${y2}`);
+  });
+}
+requestAnimationFrame(drawEdges);
+window.addEventListener('resize', drawEdges);
+
+// ---------------------------------------------------------------------------
+// SELECTION + BACKWARD TRACE
+// ---------------------------------------------------------------------------
+function ancestorsOf(id) {
+  const seen = new Set(), stack = [id];
+  while (stack.length) {
+    const cur = stack.pop();
+    byId[cur].parents.forEach(p => { if (!seen.has(p)) { seen.add(p); stack.push(p); } });
+  }
+  return seen;
+}
+
+let selectedId = null;
+function select(id) {
+  selectedId = id;
+  const anc = ancestorsOf(id);
+  const lit = new Set(anc); lit.add(id);
+  NODES.forEach(n => {
+    const el = nodeEls[n.id];
+    el.classList.toggle('selected', n.id === id);
+    el.classList.toggle('ancestor', anc.has(n.id));
+    el.classList.toggle('dim', !lit.has(n.id));
+  });
+  edgePaths.forEach(e => e.el.classList.toggle('active', lit.has(e.from) && lit.has(e.to)));
+  renderInspector(byId[id]);
+}
+
+// ---------------------------------------------------------------------------
+// INSPECTOR
+// ---------------------------------------------------------------------------
+const insp = document.getElementById('inspector');
+let headSel = 0;
+
+function renderInspector(n) {
+  headSel = 0;
+  const parentsHtml = n.parents.length
+    ? `<div class="insp-section-label">Inputs · click to trace back</div>
+       <div class="parents">${n.parents.map(p => `<span class="parent-chip" data-id="${esc(p)}">${esc(byId[p].label)}</span>`).join('')}</div>`
+    : '';
+  insp.innerHTML =
+    `<p class="insp-eyebrow">${kindName(n.kind)}</p>
+     <h2 class="insp-title">${esc(n.label)}</h2>
+     <div class="insp-hook">${esc(n.id)}</div>
+     <div class="insp-op">${esc(n.op)}</div>
+     <p class="insp-explain">${esc(n.explain)}</p>
+     <div class="insp-meta"><span class="chip">shape <b>${n.shape}</b></span></div>
+     ${parentsHtml}
+     <div class="insp-section-label">Activation values</div>
+     <div id="viz"></div>`;
+  insp.querySelectorAll('.parent-chip').forEach(c => c.onclick = () => select(c.dataset.id));
+  renderViz(n);
+  insp.scrollTop = 0;
+}
+
+function renderViz(n) {
+  const host = document.getElementById('viz');
+  if (n.viz === 'tokens') {
+    host.innerHTML = `<div class="tok-list">${D.str_tokens.map((t, i) =>
+      `<div class="tok-item">${esc(t.replace(/ /g,'·'))} <span class="id">#${D.token_ids[i]}</span></div>`).join('')}</div>`;
+    return;
+  }
+  if (n.viz === 'positions') {
+    host.innerHTML = `<div class="tok-list">${D.str_tokens.map((t, i) =>
+      `<div class="tok-item">pos <b>${i}</b> <span class="id">${esc(t.replace(/ /g,'·'))}</span></div>`).join('')}</div>`;
+    return;
+  }
+  if (n.viz === 'prediction') {
+    const max = Math.max(...D.prediction.map(p => p.prob));
+    host.innerHTML = `<div class="pred-rows">${D.prediction.map(p => {
+      const good = p.token.trim().toLowerCase() === 'couch';
+      return `<div class="pred-row${good ? ' is-good' : ''}">
+        <div class="pred-tok">"${esc(p.token.replace(/ /g,'·'))}"</div>
+        <div class="pred-track"><div class="pred-meter" style="width:${(p.prob/max*100).toFixed(1)}%"></div></div>
+        <div class="pred-pct">${(p.prob*100).toFixed(1)}%</div></div>`;
+    }).join('')}</div>
+    <p class="hm-axis">Top-10 next-token candidates at the final position.</p>`;
+    return;
+  }
+  // tensor visualizers
+  if (n.viz === 'pos_dmodel') {
+    drawHeatmap(host, A[n.id], TOKS, { signed: true, colAxis: `${D.d_model} dims →`, rowAxis: 'tokens' });
+  } else if (n.viz === 'pos_head_dhead') {
+    headPicker(host, n, (h) => {
+      const mat = A[n.id].map(posRow => posRow[h]);   // [pos][d_head]
+      return { mat, opts: { signed: true, colAxis: `${D.d_head} head-dims →`, rowAxis: 'tokens', rowLabels: TOKS } };
+    });
+  } else if (n.viz === 'head_qk') {
+    headPicker(host, n, (h) => {
+      const mat = A[n.id][h];   // [q][k]
+      return { mat, opts: { signed: !!n.signed, masked: true, colAxis: 'key (attends to) →', rowAxis: 'query', rowLabels: TOKS, colLabels: TOKS } };
+    });
+  }
+}
+
+function headPicker(host, n, build) {
+  host.innerHTML = `<div class="heads">${Array.from({length: D.n_heads}, (_, h) =>
+    `<button class="hbtn" data-h="${h}" aria-pressed="${h===headSel}">head ${h}</button>`).join('')}</div>
+    <div id="hmhost"></div>`;
+  const draw = () => {
+    const { mat, opts } = build(headSel);
+    drawHeatmap(document.getElementById('hmhost'), mat, opts.rowLabels || TOKS, opts);
+  };
+  host.querySelectorAll('.hbtn').forEach(b => b.onclick = () => {
+    headSel = +b.dataset.h;
+    host.querySelectorAll('.hbtn').forEach(x => x.setAttribute('aria-pressed', x === b));
+    draw();
+  });
+  draw();
+}
+
+// diverging colormap for signed values; sequential amber for [0,1] probs
+function divColor(v, m) {
+  if (m <= 0) return 'rgb(27,32,48)';
+  const t = Math.max(-1, Math.min(1, v / m));
+  const base = [27, 32, 48];
+  const tgt = t >= 0 ? [245, 166, 35] : [75, 143, 230];
+  const f = Math.abs(t);
+  const c = base.map((b, i) => Math.round(b + (tgt[i] - b) * f));
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+function seqColor(t) {
+  t = Math.max(0, Math.min(1, t));
+  const stops = [[0,[18,22,36]],[0.4,[120,40,95]],[0.7,[225,110,40]],[1,[252,230,150]]];
+  for (let i = 1; i < stops.length; i++) if (t <= stops[i][0]) {
+    const [a0,c0]=stops[i-1],[a1,c1]=stops[i],f=(t-a0)/(a1-a0);
+    const c=c0.map((v,k)=>Math.round(v+(c1[k]-v)*f));
+    return `rgb(${c[0]},${c[1]},${c[2]})`;
+  }
+  return 'rgb(252,230,150)';
+}
+
+function drawHeatmap(host, mat, rowLabels, opts) {
+  opts = opts || {};
+  const rows = mat.length, cols = mat[0].length;
+  // value range (ignore masked future cells for color scaling)
+  let absmax = 0, vmax = 0, vmin = 0;
+  for (let q = 0; q < rows; q++) for (let k = 0; k < cols; k++) {
+    if (opts.masked && k > q) continue;
+    const val = mat[q][k];
+    absmax = Math.max(absmax, Math.abs(val)); vmax = Math.max(vmax, val); vmin = Math.min(vmin, val);
+  }
+  const sequential = !opts.signed;
+  const colW = Math.max(4, Math.min(34, Math.floor(820 / cols)));
+  const rowH = Math.max(15, Math.min(30, Math.floor(360 / rows)));
+
+  const can = document.createElement('canvas');
+  can.width = cols; can.height = rows;
+  const ctx = can.getContext('2d');
+  for (let q = 0; q < rows; q++) for (let k = 0; k < cols; k++) {
+    const val = mat[q][k];
+    if (opts.masked && k > q) { ctx.fillStyle = 'rgb(16,18,28)'; }
+    else if (sequential) { ctx.fillStyle = seqColor(absmax ? val / absmax : 0); }
+    else { ctx.fillStyle = divColor(val, absmax); }
+    ctx.fillRect(k, q, 1, 1);
+  }
+  can.className = 'hm-canvas';
+  can.style.width = (cols * colW) + 'px';
+  can.style.height = (rows * rowH) + 'px';
+
+  host.innerHTML = '';
+  const wrap = document.createElement('div'); wrap.className = 'hm-wrap';
+  const rl = document.createElement('div'); rl.className = 'hm-rowlabels';
+  rowLabels.slice(0, rows).forEach(t => {
+    const s = document.createElement('span'); s.style.height = rowH + 'px';
+    s.textContent = t.length > 8 ? t.slice(0, 8) : t; s.title = t; rl.appendChild(s);
+  });
+  const scroll = document.createElement('div'); scroll.className = 'hm-scroll';
+  scroll.appendChild(can);
+  wrap.appendChild(rl); wrap.appendChild(scroll);
+  host.appendChild(wrap);
+
+  const axis = document.createElement('div'); axis.className = 'hm-axis';
+  axis.textContent = (opts.rowAxis ? `rows: ${opts.rowAxis}   ` : '') + (opts.colAxis ? `cols: ${opts.colAxis}` : '');
+  host.appendChild(axis);
+
+  // colorbar
+  const cb = document.createElement('div'); cb.className = 'colorbar';
+  const grad = document.createElement('div'); grad.className = 'cb-grad';
+  if (sequential) {
+    grad.style.background = `linear-gradient(90deg, ${seqColor(0)}, ${seqColor(.5)}, ${seqColor(1)})`;
+    cb.appendChild(label('0')); cb.appendChild(grad); cb.appendChild(label(absmax.toFixed(2)));
+  } else {
+    grad.style.background = `linear-gradient(90deg, ${divColor(-absmax,absmax)}, ${divColor(0,absmax)}, ${divColor(absmax,absmax)})`;
+    cb.appendChild(label((-absmax).toFixed(2))); cb.appendChild(grad); cb.appendChild(label('+' + absmax.toFixed(2)));
+  }
+  host.appendChild(cb);
+
+  // hover
+  can.onmousemove = (e) => {
+    const r = can.getBoundingClientRect();
+    const k = Math.min(cols - 1, Math.max(0, Math.floor((e.clientX - r.left) / r.width * cols)));
+    const q = Math.min(rows - 1, Math.max(0, Math.floor((e.clientY - r.top) / r.height * rows)));
+    const masked = opts.masked && k > q;
+    const rlab = (opts.rowLabels || rowLabels)[q] ?? ('row ' + q);
+    const clab = opts.colLabels ? opts.colLabels[k] : ('col ' + k);
+    showTip(e, masked
+      ? `masked (future token)<br>${esc(rlab)} ↛ ${esc(clab)}`
+      : `<b>${mat[q][k]}</b><br>row ${esc(String(rlab))} · ${esc(String(clab))}`);
+  };
+  can.onmouseleave = hideTip;
+}
+function label(t) { const s = document.createElement('span'); s.textContent = t; return s; }
+
+function kindName(k) {
+  return ({ input:'Input', embed:'Embedding', resid:'Residual stream', ln:'Normalization',
+    qkv:'Attention · Q/K/V', score:'Attention · scores', pattern:'Attention · pattern',
+    z:'Attention · values', out:'Output' })[k] || k;
+}
+
+function showTip(e, html) {
+  tip.innerHTML = html; tip.style.opacity = '1';
+  let x = e.clientX + 14, y = e.clientY + 14;
+  if (x + 290 > innerWidth) x = e.clientX - 290;
+  if (y + 80 > innerHeight) y = e.clientY - 80;
+  tip.style.left = x + 'px'; tip.style.top = y + 'px';
+}
+function hideTip() { tip.style.opacity = '0'; }
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c])); }
+
+// ---------------------------------------------------------------------------
+// TABS
+// ---------------------------------------------------------------------------
+const tabsEl = document.getElementById('tabs');
+let actsReady = false;
+tabsEl.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+  const v = t.dataset.view;
+  tabsEl.querySelectorAll('.tab').forEach(x => x.setAttribute('aria-pressed', x === t));
+  document.getElementById('view-graph').hidden = v !== 'graph';
+  document.getElementById('view-acts').hidden = v !== 'acts';
+  if (v === 'graph') requestAnimationFrame(drawEdges);
+  if (v === 'acts' && !actsReady) { initActs(); actsReady = true; }
+});
+
+// ---------------------------------------------------------------------------
+// ACTIVATION VALUES TAB — a zoomable numeric explorer through the two layers
+// ---------------------------------------------------------------------------
+const ACT_STAGES = NODES.filter(n => ['pos_dmodel', 'pos_head_dhead', 'head_qk'].includes(n.viz));
+const ZOOM = [
+  { w: 30, f: 8, d: 1 }, { w: 42, f: 9, d: 2 }, { w: 54, f: 10, d: 2 },
+  { w: 70, f: 12, d: 3 }, { w: 92, f: 14, d: 3 },
+];
+let aIdx = 0, aHead = 0, aZoom = 2;
+
+function initActs() {
+  const sel = document.getElementById('act-stage');
+  sel.innerHTML = ACT_STAGES.map((n, i) => `<option value="${i}">${esc(n.label)}</option>`).join('');
+  sel.onchange = () => { aIdx = +sel.value; aHead = 0; renderActs(); };
+  document.getElementById('act-prev').onclick = () => { aIdx = (aIdx - 1 + ACT_STAGES.length) % ACT_STAGES.length; aHead = 0; renderActs(); };
+  document.getElementById('act-next').onclick = () => { aIdx = (aIdx + 1) % ACT_STAGES.length; aHead = 0; renderActs(); };
+  document.getElementById('act-zoom').oninput = (e) => { aZoom = +e.target.value; renderGrid(); };
+  renderActs();
+}
+
+function actMatrix(node, h) {
+  if (node.viz === 'pos_dmodel')
+    return { mat: A[node.id], rowLabels: TOKS, colLabels: range(D.d_model), signed: true, masked: false };
+  if (node.viz === 'pos_head_dhead')
+    return { mat: A[node.id].map(r => r[h]), rowLabels: TOKS, colLabels: range(D.d_head), signed: true, masked: false };
+  // head_qk
+  return { mat: A[node.id][h], rowLabels: TOKS, colLabels: TOKS, signed: !!node.signed, masked: true };
+}
+function range(n) { return Array.from({ length: n }, (_, i) => i); }
+
+function renderActs() {
+  const node = ACT_STAGES[aIdx];
+  document.getElementById('act-stage').value = aIdx;
+  document.getElementById('act-count').textContent = `stage ${aIdx + 1} / ${ACT_STAGES.length}`;
+  document.getElementById('act-op').innerHTML = `${esc(node.op)}<span class="ex">${esc(node.explain)}</span>`;
+
+  // head selector only for multi-head tensors
+  const heads = document.getElementById('act-heads');
+  if (node.viz === 'pos_dmodel') { heads.innerHTML = ''; }
+  else {
+    heads.innerHTML = range(D.n_heads).map(h =>
+      `<button class="hbtn" data-h="${h}" aria-pressed="${h === aHead}">head ${h}</button>`).join('');
+    heads.querySelectorAll('.hbtn').forEach(b => b.onclick = () => {
+      aHead = +b.dataset.h;
+      heads.querySelectorAll('.hbtn').forEach(x => x.setAttribute('aria-pressed', x === b));
+      renderGrid();
+    });
+  }
+  renderGrid();
+}
+
+function renderGrid() {
+  const node = ACT_STAGES[aIdx];
+  const { mat, rowLabels, colLabels, signed, masked } = actMatrix(node, aHead);
+  const rows = mat.length, cols = mat[0].length;
+  const z = ZOOM[aZoom];
+  const sequential = !signed;
+
+  // range + stats over non-masked cells
+  let absmax = 0, mn = Infinity, mx = -Infinity, sum = 0, sq = 0, cnt = 0;
+  for (let q = 0; q < rows; q++) for (let k = 0; k < cols; k++) {
+    if (masked && k > q) continue;
+    const v = mat[q][k];
+    absmax = Math.max(absmax, Math.abs(v)); mn = Math.min(mn, v); mx = Math.max(mx, v);
+    sum += v; sq += v * v; cnt++;
+  }
+  const mean = sum / cnt, norm = Math.sqrt(sq);
+
+  document.getElementById('act-stats').innerHTML =
+    `<span class="chip">shape <b>[${rows}, ${cols}]</b></span>` +
+    `<span class="chip">min <b>${mn.toFixed(3)}</b></span>` +
+    `<span class="chip">max <b>${mx.toFixed(3)}</b></span>` +
+    `<span class="chip">mean <b>${mean.toFixed(3)}</b></span>` +
+    `<span class="chip">‖matrix‖ <b>${norm.toFixed(2)}</b></span>`;
+
+  let html = '<table class="numgrid"><thead><tr><th class="corner"></th>';
+  for (let k = 0; k < cols; k++)
+    html += `<th style="min-width:${z.w}px;font-size:${z.f}px">${esc(String(colLabels[k]).replace(/ /g, '·'))}</th>`;
+  html += '</tr></thead><tbody>';
+  for (let q = 0; q < rows; q++) {
+    html += `<tr><th style="font-size:${z.f}px">${esc(rowLabels[q])}</th>`;
+    for (let k = 0; k < cols; k++) {
+      const v = mat[q][k];
+      if (masked && k > q) { html += `<td class="masked" style="min-width:${z.w}px;font-size:${z.f - 1}px">·</td>`; continue; }
+      const t = absmax ? v / absmax : 0;
+      const bg = sequential ? seqColor(t) : divColor(v, absmax);
+      const tc = Math.abs(t) > 0.5 ? '#0c0e16' : '#cfd3e0';
+      html += `<td style="min-width:${z.w}px;font-size:${z.f}px;background:${bg};color:${tc}">${v.toFixed(z.d)}</td>`;
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+  document.getElementById('act-grid').innerHTML = html;
+}
+
+// open on the prediction so the first thing you see is a full backward trace
+select('prediction');
+requestAnimationFrame(drawEdges);
+</script>

@@ -1,0 +1,163 @@
+<style>
+  .cc-launch {
+    position: fixed; right: 22px; bottom: 22px; z-index: 100;
+    display: flex; align-items: center; gap: 9px;
+    font-family: var(--mono); font-size: 13px; font-weight: 600; color: #1a1304;
+    background: var(--accent); border: 0; border-radius: 999px; padding: 12px 18px;
+    cursor: pointer; box-shadow: 0 8px 30px rgba(245,166,35,.35);
+    transition: transform .12s, box-shadow .12s;
+  }
+  .cc-launch:hover { transform: translateY(-2px); box-shadow: 0 12px 38px rgba(245,166,35,.45); }
+  .cc-launch.hidden { display: none; }
+
+  .cc-panel {
+    position: fixed; right: 22px; bottom: 22px; z-index: 101;
+    width: min(420px, calc(100vw - 44px)); height: min(620px, calc(100vh - 44px));
+    display: none; flex-direction: column;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 16px;
+    box-shadow: 0 24px 70px rgba(0,0,0,.55); overflow: hidden;
+  }
+  .cc-panel.open { display: flex; }
+  .cc-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 14px 16px; border-bottom: 1px solid var(--border); background: var(--panel-2);
+  }
+  .cc-head .t { font-size: 14px; font-weight: 650; }
+  .cc-head .s { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 1px; }
+  .cc-x { background: transparent; border: 0; color: var(--muted); font-size: 20px; cursor: pointer; line-height: 1; padding: 2px 6px; border-radius: 6px; }
+  .cc-x:hover { color: var(--text); background: var(--panel-3); }
+
+  .cc-msgs { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+  .cc-msg { font-size: 14px; line-height: 1.55; }
+  .cc-msg .who { font-family: var(--mono); font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase; margin-bottom: 5px; }
+  .cc-msg.user .who { color: var(--blue); }
+  .cc-msg.bot .who { color: var(--accent); }
+  .cc-msg .body { color: #dfe2ec; white-space: pre-wrap; word-wrap: break-word; }
+  .cc-msg .body code { font-family: var(--mono); font-size: .88em; background: var(--panel-2); border: 1px solid var(--border-soft); border-radius: 4px; padding: 1px 5px; color: #d6c08a; }
+  .cc-hint { color: var(--muted); font-size: 13px; line-height: 1.6; }
+  .cc-hint b { color: var(--text); }
+  .cc-ctx { font-family: var(--mono); font-size: 11px; color: var(--muted); padding: 7px 16px; border-top: 1px solid var(--border-soft); border-bottom: 1px solid var(--border-soft); background: var(--panel-2); }
+  .cc-ctx b { color: var(--accent); }
+
+  .cc-form { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--border); }
+  .cc-input { flex: 1; resize: none; font-family: var(--sans); font-size: 14px; color: var(--text); background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; max-height: 120px; }
+  .cc-input:focus { outline: none; border-color: var(--accent); }
+  .cc-send { font-family: var(--mono); font-size: 13px; font-weight: 600; color: #1a1304; background: var(--accent); border: 0; border-radius: 10px; padding: 0 16px; cursor: pointer; }
+  .cc-send:disabled { opacity: .5; cursor: default; }
+  .cc-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: ccb 1s infinite; }
+  @keyframes ccb { 0%,100%{opacity:.3} 50%{opacity:1} }
+  @media (prefers-reduced-motion: reduce) { .cc-dot { animation: none; } .cc-launch { transition: none; } }
+</style>
+
+<button class="cc-launch" id="cc-launch">✦ Ask Claude about this</button>
+
+<div class="cc-panel" id="cc-panel">
+  <div class="cc-head">
+    <div>
+      <div class="t">Ask Claude</div>
+      <div class="s">grounded in this forward pass</div>
+    </div>
+    <button class="cc-x" id="cc-close" title="close">×</button>
+  </div>
+  <div class="cc-ctx" id="cc-ctx">Looking at: nothing selected yet</div>
+  <div class="cc-msgs" id="cc-msgs">
+    <div class="cc-hint">
+      I can see this graph and the activations. Ask me things like <b>"what is the 512?"</b>,
+      <b>"what does this node compute?"</b>, or <b>"why are the future cells masked?"</b>
+      Click a node first and I'll answer in context.
+    </div>
+  </div>
+  <form class="cc-form" id="cc-form">
+    <textarea class="cc-input" id="cc-input" rows="1" placeholder="Ask about what you're looking at…"></textarea>
+    <button class="cc-send" id="cc-send" type="submit">Send</button>
+  </form>
+</div>
+
+<script>
+(function () {
+  const launch = document.getElementById('cc-launch');
+  const panel = document.getElementById('cc-panel');
+  const msgs = document.getElementById('cc-msgs');
+  const form = document.getElementById('cc-form');
+  const input = document.getElementById('cc-input');
+  const send = document.getElementById('cc-send');
+  const ctxEl = document.getElementById('cc-ctx');
+  const history = [];
+
+  function open() { panel.classList.add('open'); launch.classList.add('hidden'); refreshCtx(); input.focus(); }
+  function close() { panel.classList.remove('open'); launch.classList.remove('hidden'); }
+  launch.onclick = open;
+  document.getElementById('cc-close').onclick = close;
+
+  // Read what the user is currently looking at, straight from the DOM.
+  function currentContext() {
+    const activeTab = document.querySelector('.tab[aria-pressed="true"]');
+    const tab = activeTab ? activeTab.textContent.trim() : 'Computation graph';
+    const hook = (document.querySelector('.insp-hook') || {}).textContent || null;
+    const title = (document.querySelector('.insp-title') || {}).textContent || null;
+    return { tab, hook, title };
+  }
+  function refreshCtx() {
+    const c = currentContext();
+    ctxEl.innerHTML = c.title
+      ? `Looking at: <b>${esc(c.title)}</b> · ${esc(c.tab)}`
+      : `Looking at: ${esc(c.tab)} (no node selected)`;
+  }
+  // keep the context line live as the user clicks around
+  document.addEventListener('click', () => { if (panel.classList.contains('open')) refreshCtx(); });
+
+  input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = Math.min(120, input.scrollHeight) + 'px'; });
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); } });
+
+  function addMsg(who, cls) {
+    const el = document.createElement('div');
+    el.className = 'cc-msg ' + cls;
+    el.innerHTML = `<div class="who">${who}</div><div class="body"></div>`;
+    msgs.appendChild(el);
+    msgs.scrollTop = msgs.scrollHeight;
+    return el.querySelector('.body');
+  }
+  function esc(s) { return String(s).replace(/[&<>]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;' }[c])); }
+  // tiny renderer: escape, then turn `code` into <code>
+  function render(t) { return esc(t).replace(/`([^`]+)`/g, '<code>$1</code>'); }
+
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = ''; input.style.height = 'auto';
+    send.disabled = true;
+
+    addMsg('You', 'user').textContent = text;
+    history.push({ role: 'user', content: text });
+
+    const botBody = addMsg('Claude', 'bot');
+    botBody.innerHTML = '<span class="cc-dot"></span>';
+
+    try {
+      const resp = await fetch('/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: history, context: currentContext() }),
+      });
+      if (!resp.ok || !resp.body) { botBody.textContent = `[server error ${resp.status}]`; send.disabled = false; return; }
+      const reader = resp.body.getReader();
+      const dec = new TextDecoder();
+      let acc = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        acc += dec.decode(value, { stream: true });
+        botBody.innerHTML = render(acc);
+        msgs.scrollTop = msgs.scrollHeight;
+      }
+      history.push({ role: 'assistant', content: acc });
+    } catch (err) {
+      botBody.textContent = '[connection error — is the local server running?]';
+    } finally {
+      send.disabled = false;
+      input.focus();
+    }
+  };
+})();
+</script>

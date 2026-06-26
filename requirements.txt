@@ -1,0 +1,14 @@
+# Mechanistic interpretability playground.
+# Install into a fresh virtualenv:
+#     python3 -m venv .venv
+#     .venv/bin/pip install -r requirements.txt
+# Then run:
+#     .venv/bin/python explore.py
+
+transformer-lens==3.4.0   # the microscope: run_with_cache + named hook points
+torch==2.7.1              # pulled in by transformer-lens; pinned for reproducibility
+circuitsvis>=1.43.0       # interactive attention-pattern visualizations (optional but fun)
+
+# For app.py — the local visualizer + Claude chat server:
+anthropic>=0.112.0        # Claude API SDK (the /chat endpoint, model claude-opus-4-8)
+flask>=3.1.0              # serves the page + proxies chat to Claude (keeps your key server-side)
